@@ -1,0 +1,172 @@
+name: 01 - Continuous Integration
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      - "**.md"
+  push:
+    branches:
+      - "**"
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  structure:
+    name: Project structure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check required files and ignore rules
+        run: |
+          status=0
+          for required_file in \
+            pyproject.toml uv.lock requirements.txt CLAUDE.md README.md \
+            vercel.json .vercelignore api/index.py \
+            .gitignore .github/workflows/ci.yml \
+            .github/actions/setup-python-uv/action.yml
+          do
+            if [ -s "$required_file" ]; then
+              echo "ok: $required_file"
+            else
+              echo "missing or empty file: $required_file"
+              status=1
+            fi
+          done
+
+          if grep -qx ".env" .gitignore; then
+            echo "ok: .gitignore excludes .env"
+          else
+            echo "missing rule: .gitignore must exclude .env"
+            status=1
+          fi
+
+          if [ -n "$(git ls-files .env)" ]; then
+            echo "error: .env is tracked by git"
+            status=1
+          fi
+
+          if [ -n "$(git ls-files 'models/*.joblib' 'models/*.json')" ]; then
+            echo "error: trained models must not be tracked by git"
+            status=1
+          fi
+
+          exit "$status"
+
+      - name: Check that requirements.txt matches uv.lock
+        run: |
+          python -m pip install --quiet uv
+          uv lock --check
+          uv export --no-dev --no-hashes --no-emit-project --frozen \
+            -o requirements.txt
+          if ! git diff --exit-code -- requirements.txt; then
+            echo "requirements.txt is out of date: run the export command in the README."
+            exit 1
+          fi
+          echo "ok: requirements.txt matches uv.lock"
+
+  lint:
+    name: Python code quality check (lint)
+    needs: structure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python and uv
+        uses: ./.github/actions/setup-python-uv
+
+      - name: Run pylint on the package
+        run: uv run pylint src
+
+      - name: Run pylint on the tests
+        run: >
+          uv run pylint tests
+          --disable=missing-function-docstring,redefined-outer-name,unused-argument
+
+  unit-test:
+    name: Unit tests
+    needs: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python and uv
+        uses: ./.github/actions/setup-python-uv
+
+      - name: Run unit tests with coverage
+        run: >
+          uv run pytest
+          --cov=outlier_detector
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-fail-under=80
+          --junitxml=junit-unit.xml
+
+      - name: Upload test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            junit-unit.xml
+            coverage.xml
+          if-no-files-found: ignore
+
+  api-smoke-test:
+    name: API smoke test
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python and uv
+        uses: ./.github/actions/setup-python-uv
+
+      - name: Import the Vercel entry point and check the routes
+        run: |
+          uv run python -c "
+          import importlib.util
+          from fastapi.testclient import TestClient
+          spec = importlib.util.spec_from_file_location('entry', 'api/index.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          client = TestClient(module.app)
+          assert client.get('/health').json() == {'status': 'ok'}
+          assert client.get('/models').status_code == 200
+          print('ok: entry point serves /health and /models')
+          "
+
+  security:
+    name: Security scan
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python and uv
+        uses: ./.github/actions/setup-python-uv
+
+      - name: Scan source code with Bandit
+        run: uvx bandit==1.9.4 --recursive src --severity-level medium

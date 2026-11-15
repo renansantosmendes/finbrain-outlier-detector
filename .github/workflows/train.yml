@@ -1,0 +1,165 @@
+name: 02 - Train Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "Comma-separated symbols, for example AAPL,PETR4.SA"
+        required: true
+        default: "AAPL"
+        type: string
+      period:
+        description: "Price history given to yfinance, for example 3y or 5y"
+        required: true
+        default: "3y"
+        type: string
+      contamination:
+        description: "Expected share of atypical days, between 0 and 0.5"
+        required: true
+        default: 0.02
+        type: number
+      random_seed:
+        description: "Seed of the Isolation Forest"
+        required: true
+        default: 42
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: train-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci-check:
+    name: Check that CI passed for this commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: read
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Wait for the CI run of this commit
+        run: |
+          for attempt in $(seq 1 60); do
+            successful_runs=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow ci.yml \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq 'length')
+            if [ "$successful_runs" -ge 1 ]; then
+              echo "CI passed for commit $GITHUB_SHA."
+              exit 0
+            fi
+            total_runs=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow ci.yml \
+              --commit "$GITHUB_SHA" \
+              --json databaseId \
+              --jq 'length')
+            pending_runs=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow ci.yml \
+              --commit "$GITHUB_SHA" \
+              --json status \
+              --jq '[.[] | select(.status != "completed")] | length')
+            if [ "$pending_runs" -eq 0 ] && [ "$total_runs" -gt 0 ]; then
+              echo "The CI runs of commit $GITHUB_SHA finished without success."
+              exit 1
+            fi
+            if [ "$pending_runs" -eq 0 ] && [ "$attempt" -ge 6 ]; then
+              echo "No CI run was found for commit $GITHUB_SHA after 3 minutes."
+              exit 1
+            fi
+            echo "Waiting for the CI of commit $GITHUB_SHA (attempt $attempt of 60)."
+            sleep 30
+          done
+          echo "Timed out waiting for the CI of commit $GITHUB_SHA."
+          exit 1
+
+  plan:
+    name: Check the tickers
+    needs: ci-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      tickers: ${{ steps.parse.outputs.tickers }}
+      tickers_csv: ${{ steps.parse.outputs.tickers_csv }}
+
+    env:
+      TICKERS_INPUT: ${{ inputs.tickers }}
+
+    steps:
+      - name: Parse and validate the ticker list
+        id: parse
+        run: |
+          invalid=$(printf '%s' "$TICKERS_INPUT" | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | grep -v '^$' \
+            | grep -E -v '^[A-Za-z0-9._^=-]+$' || true)
+          if [ -n "$invalid" ]; then
+            echo "Invalid ticker symbols:"
+            echo "$invalid"
+            exit 1
+          fi
+
+          tickers_json=$(printf '%s' "$TICKERS_INPUT" | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | grep -v '^$' \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          if [ "$(printf '%s' "$tickers_json" | jq 'length')" -lt 1 ]; then
+            echo "No ticker symbol was given."
+            exit 1
+          fi
+
+          tickers_csv=$(printf '%s' "$tickers_json" | jq -r 'join(",")')
+          echo "tickers=$tickers_json" >> "$GITHUB_OUTPUT"
+          echo "tickers_csv=$tickers_csv" >> "$GITHUB_OUTPUT"
+          echo "Tickers to train: $tickers_csv"
+
+  train:
+    name: Train the detectors
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      TICKERS: ${{ needs.plan.outputs.tickers_csv }}
+      PERIOD: ${{ inputs.period }}
+      CONTAMINATION: ${{ inputs.contamination }}
+      RANDOM_SEED: ${{ inputs.random_seed }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python and uv
+        uses: ./.github/actions/setup-python-uv
+
+      - name: Train one detector per ticker
+        run: >
+          uv run python -m outlier_detector.training.train
+          --tickers "$TICKERS"
+          --period "$PERIOD"
+          --contamination "$CONTAMINATION"
+          --random-seed "$RANDOM_SEED"
+          --model-directory models
+
+      - name: Upload the trained models and their metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models
+          path: |
+            models/*.joblib
+            models/*.json
+          if-no-files-found: error
+          retention-days: 30

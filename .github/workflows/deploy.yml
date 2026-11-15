@@ -1,0 +1,123 @@
+name: 03 - Deploy API to Vercel
+
+on:
+  workflow_dispatch:
+    inputs:
+      train_run_id:
+        description: "Run id of a successful Train workflow. Its trained models are published with the API."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-vercel
+  cancel-in-progress: false
+
+env:
+  VERCEL_CLI_VERSION: "65.16.0"
+
+jobs:
+  validate-train-run:
+    name: Check that the Train run succeeded
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TRAIN_RUN_ID: ${{ inputs.train_run_id }}
+
+    steps:
+      - name: Require a successful Train run of this repository
+        run: |
+          if ! printf '%s' "$TRAIN_RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "The train_run_id must be a number, got: $TRAIN_RUN_ID"
+            exit 1
+          fi
+          conclusion=$(gh run view "$TRAIN_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json workflowName,conclusion \
+            --jq 'if .workflowName == "02 - Train Model" then .conclusion else "wrong-workflow" end')
+          if [ "$conclusion" != "success" ]; then
+            echo "Run $TRAIN_RUN_ID is not a successful Train run: $conclusion"
+            exit 1
+          fi
+          echo "Run $TRAIN_RUN_ID is a successful Train run."
+
+  deploy:
+    name: Publish the API on Vercel
+    needs: validate-train-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ vars.DEPLOY_ENVIRONMENT || 'production' }}
+
+    env:
+      TRAIN_RUN_ID: ${{ inputs.train_run_id }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check the Vercel configuration
+        run: |
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_ORG_ID" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "The secrets VERCEL_TOKEN, VERCEL_ORG_ID and VERCEL_PROJECT_ID are required."
+            exit 1
+          fi
+          echo "::add-mask::$VERCEL_TOKEN"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download the trained models of the Train run
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-models
+          path: models
+          run-id: ${{ inputs.train_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: List the models that will be published
+        run: |
+          ls -l models
+          if [ -z "$(ls models/*.joblib 2>/dev/null)" ]; then
+            echo "The Train run did not produce any model."
+            exit 1
+          fi
+
+      - name: Set up Node.js for the Vercel CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the Vercel CLI
+        run: npm install --global "vercel@${VERCEL_CLI_VERSION}"
+
+      - name: Deploy to Vercel production
+        run: |
+          vercel deploy --prod --yes --token "$VERCEL_TOKEN" > deploy-output.txt
+          url=$(tail -n 1 deploy-output.txt)
+          echo "Deployed to $url"
+          echo "DEPLOY_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Check that the API answers and has models
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 20 "$DEPLOY_URL/health" > /dev/null 2>&1; then
+              models=$(curl -fsS --max-time 20 "$DEPLOY_URL/models")
+              if [ "$(printf '%s' "$models" | jq '.tickers | length')" -ge 1 ]; then
+                echo "$models"
+                echo "The API is live at $DEPLOY_URL"
+                exit 0
+              fi
+            fi
+            echo "Attempt $attempt of 30: the API is not ready yet."
+            sleep 10
+          done
+          echo "The API did not answer with a trained model."
+          exit 1
