@@ -15,7 +15,8 @@ organizado em módulos com testes.
 api/index.py                       entry point do Vercel (expõe o app FastAPI)
 vercel.json                        função Python e rewrite de todas as rotas
 requirements.txt                   dependências de execução (gerado do uv.lock)
-pyproject.toml, uv.lock            dependências do projeto (uv)
+pyproject.toml, uv.lock            dependências do projeto (uv); extras dev e notebook
+notebooks/outlier_detection_training.ipynb  notebook didático do treino (versão sem execução)
 models/                            modelos treinados (gerado; fora do git)
 src/outlier_detector/
   data/market_data.py              download de preços com yfinance
@@ -39,8 +40,12 @@ Pré-requisito: [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --extra dev                 # instala dependências e ferramentas de teste
+uv sync --extra dev --extra notebook # também matplotlib e ipykernel, para o notebook
 uv run pytest                       # testes unitários
 uv run pylint src                   # lint do pacote
+
+# notebook didático: abra notebooks/outlier_detection_training.ipynb com o
+# kernel do .venv do projeto (ele baixa os preços do Yahoo Finance)
 
 # treina AAPL e PETR4.SA, salvando em models/ (baixa preços do Yahoo Finance)
 uv run python -m outlier_detector.training.train --tickers AAPL,PETR4.SA
