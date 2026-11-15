@@ -16,7 +16,8 @@ api/index.py                       entry point do Vercel (expõe o app FastAPI)
 vercel.json                        função Python e rewrite de todas as rotas
 requirements.txt                   dependências de execução (gerado do uv.lock)
 pyproject.toml, uv.lock            dependências do projeto (uv); extras dev e notebook
-notebooks/outlier_detection_training.ipynb  notebook didático do treino (versão sem execução)
+notebooks/outlier_detection_training.ipynb  notebook didático do treino (versão com funções)
+notebooks/outlier_detection_simple.ipynb    versão simples do treino, sem funções, para a aula
 models/                            modelos treinados (gerado; fora do git)
 src/outlier_detector/
   data/market_data.py              download de preços com yfinance
