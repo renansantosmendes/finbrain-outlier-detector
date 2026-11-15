@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project generated files
+models/*.joblib
+models/*.json
+artifacts/
+.vercel/
+.coverage
+coverage.xml
+junit-unit.xml

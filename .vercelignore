@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+venv
+.env
+.pytest_cache
+.mypy_cache
+.coverage
+coverage.xml
+junit-unit.xml
+__pycache__
+*.pyc
+tests
+artifacts
+docs
+specs
+*.md
