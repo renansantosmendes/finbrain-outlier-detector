@@ -1,6 +1,7 @@
 """In-memory registry of the detectors downloaded from Weights & Biases."""
 
 import logging
+import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,8 +18,31 @@ from outlier_detector.registry.wandb_model_store import (
 )
 
 DEFAULT_PROJECT_NAME = "outlier-detector"
+WANDB_DIRECTORY_VARIABLES = {
+    "WANDB_CONFIG_DIR": "config",
+    "WANDB_CACHE_DIR": "cache",
+    "WANDB_DATA_DIR": "data",
+}
 
 logger = logging.getLogger(__name__)
+
+
+def use_writable_wandb_directories(base_directory: Path | None = None) -> None:
+    """Point the W&B client to writable folders, unless they are already set.
+
+    Hosts such as Vercel make the home folder read-only, and the W&B client
+    writes its configuration there when it starts. Setting these variables
+    before the client exists moves that writing to a temporary folder.
+
+    Parameters
+    ----------
+    base_directory : Path | None, optional
+        Folder that receives the ``config``, ``cache`` and ``data``
+        subfolders. ``None`` uses ``wandb`` inside the temporary folder.
+    """
+    root = base_directory or Path(tempfile.gettempdir()) / "wandb"
+    for variable, subfolder in WANDB_DIRECTORY_VARIABLES.items():
+        os.environ.setdefault(variable, str(root / subfolder))
 
 
 class ModelNotFoundError(LookupError):
@@ -104,6 +128,7 @@ class WandbModelRegistry:
         """
         if self._api is None:
             load_dotenv(dotenv_path=self.env_file_path)
+            use_writable_wandb_directories()
             self._api = wandb.Api()
         return self._api
 
