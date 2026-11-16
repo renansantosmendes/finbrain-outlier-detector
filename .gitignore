@@ -227,3 +227,6 @@ artifacts/
 .coverage
 coverage.xml
 junit-unit.xml
+
+# Weights & Biases local run folders
+wandb/
