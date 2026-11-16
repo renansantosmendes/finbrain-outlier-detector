@@ -1,30 +1,29 @@
-"""Isolation Forest detector of atypical feature rows."""
+"""Isolation Forest detector of atypical trading days."""
 
 from pathlib import Path
 
 import joblib
 import pandas as pd
 from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import RobustScaler
 
-ANOMALY_THRESHOLD = 0.0
+DEFAULT_CONTAMINATION = 0.1
+DEFAULT_N_ESTIMATORS = 300
+DEFAULT_RANDOM_SEED = 42
 
 
 class IsolationForestDetector:
-    """Score how isolated each row of features is from the training rows.
+    """Score how isolated each trading day is from the training days.
 
-    The features are scaled with a ``RobustScaler``, which uses medians
-    and quartiles and is therefore less sensitive to the extreme days the
-    detector is looking for. A score below ``ANOMALY_THRESHOLD`` (0) marks
-    the row as atypical.
+    A higher score means a more atypical day. The label ``is_atypical`` is
+    True when the Isolation Forest classifies the day as an outlier, using
+    the ``contamination`` share of the training data as the cut-off.
 
     Parameters
     ----------
     contamination : float, optional
-        Expected share of atypical rows in the training data, between 0
-        and 0.5. It sets the offset of the scores. The default is 0.02.
+        Expected share of outliers in the training data. The default is 0.1.
     n_estimators : int, optional
-        Number of isolation trees. The default is 200.
+        Number of isolation trees. The default is 300.
     random_seed : int, optional
         Seed that makes the trees reproducible. The default is 42.
 
@@ -35,26 +34,20 @@ class IsolationForestDetector:
 
     Example
     -------
-    >>> import numpy as np
-    >>> import pandas as pd
-    >>> rng = np.random.default_rng(0)
-    >>> training = pd.DataFrame(rng.normal(size=(300, 2)), columns=["a", "b"])
-    >>> detector = IsolationForestDetector().fit(training)
-    >>> scores = detector.decision_scores(training.tail(3))
-    >>> scores.shape
-    (3,)
+    >>> detector = IsolationForestDetector()  # doctest: +SKIP
+    >>> detector.fit(training_features)  # doctest: +SKIP
+    >>> detector.score_days(new_features)  # doctest: +SKIP
     """
 
     def __init__(
         self,
-        contamination: float = 0.02,
-        n_estimators: int = 200,
-        random_seed: int = 42,
+        contamination: float = DEFAULT_CONTAMINATION,
+        n_estimators: int = DEFAULT_N_ESTIMATORS,
+        random_seed: int = DEFAULT_RANDOM_SEED,
     ) -> None:
         self.contamination = contamination
         self.n_estimators = n_estimators
         self.random_seed = random_seed
-        self.scaler = RobustScaler()
         self.forest = IsolationForest(
             n_estimators=n_estimators,
             contamination=contamination,
@@ -76,11 +69,10 @@ class IsolationForestDetector:
             The same detector, now fitted.
         """
         self.feature_columns = list(features.columns)
-        scaled_features = self.scaler.fit_transform(features)
-        self.forest.fit(scaled_features)
+        self.forest.fit(features)
         return self
 
-    def decision_scores(self, features: pd.DataFrame) -> pd.Series:
+    def score_days(self, features: pd.DataFrame) -> pd.DataFrame:
         """Score rows against the fitted model.
 
         Parameters
@@ -91,9 +83,9 @@ class IsolationForestDetector:
 
         Returns
         -------
-        pd.Series
-            Score per row, indexed like ``features``. Negative values mean
-            the row is atypical.
+        pd.DataFrame
+            Frame indexed like ``features`` with the columns ``score``
+            (higher means more atypical) and ``is_atypical`` (boolean).
 
         Raises
         ------
@@ -106,34 +98,36 @@ class IsolationForestDetector:
                 f"expected {self.feature_columns}, "
                 f"got {list(features.columns)}."
             )
-        scaled_features = self.scaler.transform(features)
-        scores = self.forest.decision_function(scaled_features)
-        return pd.Series(scores, index=features.index)
-
-    def is_atypical(self, scores: pd.Series) -> pd.Series:
-        """Flag the scores that fall below the anomaly threshold.
-
-        Parameters
-        ----------
-        scores : pd.Series
-            Scores returned by ``decision_scores``.
-
-        Returns
-        -------
-        pd.Series
-            Boolean series on the same index, True for atypical rows.
-        """
-        return scores < ANOMALY_THRESHOLD
+        return pd.DataFrame(
+            {
+                "score": -self.forest.score_samples(features),
+                "is_atypical": self.forest.predict(features) == -1,
+            },
+            index=features.index,
+        )
 
     def save(self, path: Path) -> None:
         """Write the fitted detector to a joblib file.
+
+        The file holds a plain dictionary with the sklearn model and the
+        settings, not a pickled instance of this class. Any environment can
+        read it, including the notebooks that define their own detector.
 
         Parameters
         ----------
         path : Path
             Destination file. Its parent directory must exist.
         """
-        joblib.dump(self, path)
+        joblib.dump(
+            {
+                "forest": self.forest,
+                "feature_columns": self.feature_columns,
+                "contamination": self.contamination,
+                "n_estimators": self.n_estimators,
+                "random_seed": self.random_seed,
+            },
+            path,
+        )
 
     @staticmethod
     def load(path: Path) -> "IsolationForestDetector":
@@ -147,6 +141,14 @@ class IsolationForestDetector:
         Returns
         -------
         IsolationForestDetector
-            The stored detector.
+            The stored detector, ready to score.
         """
-        return joblib.load(path)
+        stored = joblib.load(path)
+        detector = IsolationForestDetector(
+            contamination=stored["contamination"],
+            n_estimators=stored["n_estimators"],
+            random_seed=stored["random_seed"],
+        )
+        detector.forest = stored["forest"]
+        detector.feature_columns = stored["feature_columns"]
+        return detector

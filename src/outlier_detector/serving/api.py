@@ -1,21 +1,24 @@
-"""FastAPI application that serves the trained outlier detectors.
+"""FastAPI application that serves the outlier detectors held in memory.
+
+When the application is created, it downloads from Weights & Biases the
+detectors of the tickers listed in ``OUTLIER_TICKERS`` and keeps them in
+memory. Requests then download only the market data.
 
 Run it locally from the project root::
 
     uv run uvicorn api.index:app --reload
-
-The model folder is read from the ``OUTLIER_MODEL_DIRECTORY`` variable and
-defaults to the ``models`` folder at the project root.
 """
 
+import logging
 import os
-from pathlib import Path
+import time
 
 from fastapi import FastAPI, HTTPException
 
-from outlier_detector.models.artifact_store import (
+from outlier_detector.serving.model_registry import (
+    DEFAULT_PROJECT_NAME,
     ModelNotFoundError,
-    list_trained_tickers,
+    WandbModelRegistry,
 )
 from outlier_detector.serving.schemas import (
     ModelsResponse,
@@ -24,33 +27,74 @@ from outlier_detector.serving.schemas import (
 )
 from outlier_detector.serving.service import detect_atypical_days
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-MODEL_DIRECTORY_VARIABLE = "OUTLIER_MODEL_DIRECTORY"
+TICKERS_VARIABLE = "OUTLIER_TICKERS"
+PROJECT_VARIABLE = "OUTLIER_WANDB_PROJECT"
+ENTITY_VARIABLE = "WANDB_ENTITY"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+logger = logging.getLogger(__name__)
 
 
-def default_model_directory() -> Path:
-    """Return the folder with the trained models.
+def configured_tickers() -> list[str]:
+    """Read the tickers to load at startup from the environment.
 
     Returns
     -------
-    Path
-        The value of ``OUTLIER_MODEL_DIRECTORY`` when it is set, otherwise
-        the ``models`` folder at the project root.
+    list[str]
+        Tickers of the ``OUTLIER_TICKERS`` variable, separated by commas.
+        Empty when the variable is not set.
+
+    Example
+    -------
+    >>> os.environ["OUTLIER_TICKERS"] = "AAPL, PETR4.SA"
+    >>> configured_tickers()
+    ['AAPL', 'PETR4.SA']
     """
-    configured = os.environ.get(MODEL_DIRECTORY_VARIABLE)
-    if configured:
-        return Path(configured)
-    return PROJECT_ROOT / "models"
+    raw_value = os.environ.get(TICKERS_VARIABLE, "")
+    symbols = (symbol.strip() for symbol in raw_value.split(","))
+    return [symbol for symbol in symbols if symbol]
 
 
-def create_app(model_directory: Path | None = None) -> FastAPI:
-    """Build the FastAPI application with its routes.
+def build_default_registry() -> WandbModelRegistry:
+    """Create the registry from the project and entity in the environment.
+
+    Returns
+    -------
+    WandbModelRegistry
+        Registry for ``OUTLIER_WANDB_PROJECT`` (default ``outlier-detector``)
+        and the entity in ``WANDB_ENTITY``, when set. No network call is made.
+    """
+    return WandbModelRegistry(
+        project_name=os.environ.get(PROJECT_VARIABLE, DEFAULT_PROJECT_NAME),
+        entity=os.environ.get(ENTITY_VARIABLE) or None,
+    )
+
+
+def configure_logging() -> None:
+    """Send the application logs to stderr at INFO level when unconfigured.
+
+    Hosts such as Vercel do not configure the root logger, so without this
+    call the INFO messages of the API would be dropped. When the root logger
+    already has handlers, for example under uvicorn, nothing changes.
+    """
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+
+
+def create_app(
+    registry: WandbModelRegistry | None = None,
+    tickers: list[str] | None = None,
+) -> FastAPI:
+    """Build the FastAPI application and load its detectors into memory.
 
     Parameters
     ----------
-    model_directory : Path | None, optional
-        Folder with the trained models. ``None`` uses
-        ``default_model_directory``.
+    registry : WandbModelRegistry | None, optional
+        Registry that holds the detectors. ``None`` builds it from the
+        environment.
+    tickers : list[str] | None, optional
+        Tickers to load at startup. ``None`` reads ``OUTLIER_TICKERS``.
 
     Returns
     -------
@@ -60,48 +104,62 @@ def create_app(model_directory: Path | None = None) -> FastAPI:
 
     Example
     -------
-    >>> from pathlib import Path
-    >>> app = create_app(Path("models"))  # doctest: +SKIP
-    >>> app.title  # doctest: +SKIP
-    'Outlier Detector API'
+    >>> app = create_app(tickers=[])  # doctest: +SKIP
     """
-    directory = model_directory or default_model_directory()
+    configure_logging()
+    active_registry = registry or build_default_registry()
+    startup_tickers = configured_tickers() if tickers is None else tickers
+    if startup_tickers:
+        loaded_tickers = active_registry.load_all(startup_tickers)
+        logger.info(
+            "Startup loaded %d of %d model(s): loaded=%s requested=%s",
+            len(loaded_tickers),
+            len(startup_tickers),
+            loaded_tickers,
+            startup_tickers,
+        )
+    else:
+        logger.info("Startup without models: OUTLIER_TICKERS is empty.")
+
     application = FastAPI(
         title="Outlier Detector API",
-        description="Scores market days with Isolation Forest detectors.",
-        version="0.1.0",
+        description="Scores trading days with Isolation Forest detectors.",
+        version="0.2.0",
     )
 
     @application.get("/health")
-    def health() -> dict[str, str]:
-        """Report that the service is running.
+    def health() -> dict[str, object]:
+        """Report that the service is running and how many models are loaded.
 
         Returns
         -------
-        dict[str, str]
-            Constant status ``{"status": "ok"}``.
+        dict[str, object]
+            Status and the number of detectors in memory.
         """
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "models_loaded": len(active_registry.loaded_tickers()),
+        }
 
     @application.get("/models", response_model=ModelsResponse)
     def models() -> ModelsResponse:
-        """List the tickers that have a trained detector.
+        """List the tickers whose detectors are in memory.
 
         Returns
         -------
         ModelsResponse
             Tickers in alphabetical order.
         """
-        return ModelsResponse(tickers=list_trained_tickers(directory))
+        return ModelsResponse(tickers=active_registry.loaded_tickers())
 
     @application.post("/predict", response_model=PredictResponse)
     def predict(request: PredictRequest) -> PredictResponse:
-        """Score the most recent days of the prices in the request.
+        """Score the most recent days of a ticker.
 
         Parameters
         ----------
         request : PredictRequest
-            Ticker, daily prices and number of days to return.
+            Ticker and number of days to return.
 
         Returns
         -------
@@ -111,14 +169,35 @@ def create_app(model_directory: Path | None = None) -> FastAPI:
         Raises
         ------
         HTTPException
-            404 when the ticker has no trained detector, 422 when the
-            prices cannot be scored with the stored detector.
+            404 when no detector is in memory for the ticker, 422 when the
+            market data does not allow building the features.
         """
+        started_at = time.perf_counter()
         try:
-            return detect_atypical_days(directory, request)
+            response = detect_atypical_days(request, active_registry)
         except ModelNotFoundError as error:
+            logger.warning(
+                "Prediction rejected: no model in memory for ticker=%s",
+                request.ticker,
+            )
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
+            logger.warning(
+                "Prediction rejected: insufficient data for ticker=%s: %s",
+                request.ticker,
+                error,
+            )
             raise HTTPException(status_code=422, detail=str(error)) from error
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        logger.info(
+            "Prediction served: ticker=%s last_n_days=%d days=%d "
+            "atypical_days=%d duration_ms=%.1f",
+            request.ticker,
+            request.last_n_days,
+            len(response.days),
+            sum(day.is_atypical for day in response.days),
+            duration_ms,
+        )
+        return response
 
     return application

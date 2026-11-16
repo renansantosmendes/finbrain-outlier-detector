@@ -1,101 +1,173 @@
-"""Tests of the HTTP routes, using the FastAPI test client."""
+"""Tests of the HTTP routes, with the registry and market data mocked."""
 
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from outlier_detector.serving.api import create_app, default_model_directory
-from tests.outlier_detector.serving.test_service import (
-    price_records,
-    train_detector,
+from outlier_detector.serving import api
+from outlier_detector.serving.api import (
+    configured_tickers,
+    create_app,
 )
+from outlier_detector.serving.model_registry import WandbModelRegistry
 
 
 @pytest.fixture
-def client(tmp_path: Path) -> TestClient:
-    """Build a test client on a model folder with one trained ticker.
+def client(loaded_registry: WandbModelRegistry) -> TestClient:
+    """Build a test client on a registry with one detector in memory.
 
     Parameters
     ----------
-    tmp_path : Path
-        Pytest folder for this test.
+    loaded_registry : WandbModelRegistry
+        Registry holding the AAPL detector.
 
     Returns
     -------
     TestClient
-        Client of the application.
+        Client of the application, with no startup download.
     """
-    train_detector(tmp_path, "AAPL")
-    return TestClient(create_app(tmp_path))
+    return TestClient(create_app(registry=loaded_registry, tickers=[]))
 
 
-def test_health_reports_ok(client: TestClient) -> None:
+def test_health_reports_the_number_of_models(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "models_loaded": 1}
 
 
-def test_models_lists_trained_tickers(client: TestClient) -> None:
-    response = client.get("/models")
-    assert response.json() == {"tickers": ["AAPL"]}
+def test_models_lists_the_tickers_in_memory(client: TestClient) -> None:
+    assert client.get("/models").json() == {"tickers": ["AAPL"]}
 
 
-def test_predict_returns_scored_days(client: TestClient) -> None:
-    body = {
-        "ticker": "AAPL",
-        "prices": [
-            {
-                "day": record.day.isoformat(),
-                "close": record.close,
-                "volume": record.volume,
-            }
-            for record in price_records(90)
-        ],
-        "last_n_days": 2,
-    }
-    response = client.post("/predict", json=body)
+def test_predict_returns_the_scored_days(client: TestClient) -> None:
+    response = client.post(
+        "/predict",
+        json={"ticker": "AAPL", "last_n_days": 2},
+    )
     assert response.status_code == 200
-    days = response.json()["days"]
-    assert len(days) == 2
-    assert set(days[0]) == {"day", "score", "is_atypical"}
+    body = response.json()
+    assert body["ticker"] == "AAPL"
+    assert len(body["days"]) == 2
+    assert set(body["days"][0]) == {"day", "score", "is_atypical"}
 
 
-def test_predict_returns_404_for_unknown_ticker(client: TestClient) -> None:
-    body = {
-        "ticker": "NOPE",
-        "prices": [
-            {
-                "day": record.day.isoformat(),
-                "close": record.close,
-                "volume": record.volume,
-            }
-            for record in price_records(70)
-        ],
-    }
-    response = client.post("/predict", json=body)
+def test_predict_returns_404_for_a_ticker_not_in_memory(
+    client: TestClient,
+) -> None:
+    response = client.post("/predict", json={"ticker": "NOPE"})
     assert response.status_code == 404
 
 
-def test_predict_returns_422_for_invalid_prices(client: TestClient) -> None:
-    body = {
-        "ticker": "AAPL",
-        "prices": [{"day": "2024-01-02", "close": -1, "volume": 1}],
-    }
-    response = client.post("/predict", json=body)
+def test_predict_rejects_an_unsafe_ticker(client: TestClient) -> None:
+    response = client.post("/predict", json={"ticker": "../etc"})
     assert response.status_code == 422
 
 
-def test_default_model_directory_reads_the_environment(
+def test_predict_rejects_a_request_without_ticker(client: TestClient) -> None:
+    response = client.post("/predict", json={"last_n_days": 3})
+    assert response.status_code == 422
+
+
+def test_configured_tickers_reads_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OUTLIER_TICKERS", "AAPL, PETR4.SA,")
+    assert configured_tickers() == ["AAPL", "PETR4.SA"]
+
+
+def test_configured_tickers_is_empty_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OUTLIER_TICKERS", raising=False)
+    assert configured_tickers() == []
+
+
+def test_create_app_preloads_the_configured_tickers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("OUTLIER_MODEL_DIRECTORY", str(tmp_path))
-    assert default_model_directory() == tmp_path
+    requested = []
+
+    def fake_load_all(
+        self: WandbModelRegistry,
+        tickers: list[str],
+    ) -> list[str]:
+        """Record the tickers requested at startup.
+
+        Parameters
+        ----------
+        self : WandbModelRegistry
+            Registry instance, ignored.
+        tickers : list[str]
+            Tickers requested at startup.
+
+        Returns
+        -------
+        list[str]
+            Empty list; nothing is actually loaded.
+        """
+        requested.extend(tickers)
+        return []
+
+    monkeypatch.setattr(WandbModelRegistry, "load_all", fake_load_all)
+    monkeypatch.setenv("OUTLIER_TICKERS", "AAPL,PETR4.SA")
+    registry = WandbModelRegistry(entity="team", download_directory=tmp_path)
+    create_app(registry=registry)
+    assert requested == ["AAPL", "PETR4.SA"]
 
 
-def test_default_model_directory_falls_back_to_project_models(
+def test_build_default_registry_reads_the_project(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("OUTLIER_MODEL_DIRECTORY", raising=False)
-    assert default_model_directory().name == "models"
+    monkeypatch.setenv("OUTLIER_WANDB_PROJECT", "my-project")
+    monkeypatch.setenv("WANDB_ENTITY", "my-team")
+    registry = api.build_default_registry()
+    assert registry.project_name == "my-project"
+    assert registry.entity == "my-team"
+
+
+def test_predict_logs_the_served_prediction(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("INFO", logger="outlier_detector.serving.api"):
+        client.post("/predict", json={"ticker": "AAPL", "last_n_days": 2})
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Prediction served: ticker=AAPL last_n_days=2 days=2" in message
+        for message in messages
+    )
+
+
+def test_predict_logs_a_warning_for_a_missing_model(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="outlier_detector.serving.api"):
+        client.post("/predict", json={"ticker": "NOPE"})
+    warnings = [
+        record for record in caplog.records if record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "ticker=NOPE" in warnings[0].getMessage()
+
+
+def test_startup_logs_the_models_that_were_loaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        WandbModelRegistry,
+        "load_all",
+        lambda self, tickers: ["AAPL"],
+    )
+    registry = WandbModelRegistry(entity="team", download_directory=tmp_path)
+    with caplog.at_level("INFO", logger="outlier_detector.serving.api"):
+        create_app(registry=registry, tickers=["AAPL", "NOPE"])
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Startup loaded 1 of 2 model(s): loaded=['AAPL']" in message
+        for message in messages
+    )

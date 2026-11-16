@@ -1,36 +1,43 @@
-"""Score the recent days of a request with the stored detector of a ticker."""
+"""Score the recent days of a ticker with the detector kept in memory."""
 
-from pathlib import Path
+from datetime import date, timedelta
 
-import pandas as pd
-
-from outlier_detector.features.price_features import build_features
-from outlier_detector.models.artifact_store import (
-    load_metadata,
-    load_model,
+from outlier_detector.data.market_data import (
+    DEFAULT_BENCHMARK,
+    load_benchmark_log_returns,
+    load_earnings_days,
+    load_prices,
 )
+from outlier_detector.features.price_features import build_features
+from outlier_detector.serving.model_registry import WandbModelRegistry
 from outlier_detector.serving.schemas import (
     OutlierDay,
     PredictRequest,
     PredictResponse,
 )
 
+LOOKBACK_DAYS = 365
+
 
 def detect_atypical_days(
-    model_directory: Path,
     request: PredictRequest,
+    registry: WandbModelRegistry,
+    today: date | None = None,
 ) -> PredictResponse:
-    """Score the most recent days of a request with its ticker's detector.
+    """Score the most recent days of a ticker with its in-memory detector.
 
-    The features are built from the prices of the request only, so the
-    detector never sees data that is not in the request.
+    The prices, the benchmark and the earnings dates are downloaded for the
+    last ``LOOKBACK_DAYS`` days. The features use only the current day and
+    earlier days, so each score is the one the detector gives on that day.
 
     Parameters
     ----------
-    model_directory : Path
-        Folder that holds the trained models.
     request : PredictRequest
-        Validated request with the prices and the number of days to return.
+        Ticker and number of days to return.
+    registry : WandbModelRegistry
+        Registry that holds the detector of the ticker.
+    today : date | None, optional
+        Reference date of the lookback window. ``None`` uses today.
 
     Returns
     -------
@@ -40,39 +47,35 @@ def detect_atypical_days(
     Raises
     ------
     ModelNotFoundError
-        If the ticker has no trained detector.
+        If no detector is in memory for the ticker.
     ValueError
-        If the features of the prices do not match the stored detector.
-
-    Example
-    -------
-    >>> from pathlib import Path
-    >>> detect_atypical_days(Path("models"), request)  # doctest: +SKIP
+        If the market data does not give any feature row.
     """
-    detector = load_model(model_directory, request.ticker)
-    metadata = load_metadata(model_directory, request.ticker)
-    prices = pd.DataFrame(
-        {
-            "Close": [record.close for record in request.prices],
-            "Volume": [record.volume for record in request.prices],
-        },
-        index=pd.DatetimeIndex([record.day for record in request.prices]),
+    loaded = registry.get_model(request.ticker)
+    reference_day = today or date.today()
+    start = (reference_day - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    features = build_features(
+        load_prices(request.ticker, start),
+        load_benchmark_log_returns(DEFAULT_BENCHMARK, start),
+        load_earnings_days(request.ticker),
     )
-    features = build_features(prices)
     if features.empty:
-        raise ValueError("Not enough prices to build the features.")
-    scores = detector.decision_scores(features)
-    atypical = detector.is_atypical(scores)
+        raise ValueError(
+            "Not enough market data to build the features of "
+            f"{request.ticker!r}."
+        )
+    scored = loaded.detector.score_days(features).tail(request.last_n_days)
     days = [
         OutlierDay(
             day=timestamp.date(),
-            score=round(float(score), 6),
-            is_atypical=bool(atypical.loc[timestamp]),
+            score=round(float(row["score"]), 6),
+            is_atypical=bool(row["is_atypical"]),
         )
-        for timestamp, score in scores.tail(request.last_n_days).items()
+        for timestamp, row in scored.iterrows()
     ]
+    trained_at = loaded.metadata.get("trained_at")
     return PredictResponse(
         ticker=request.ticker,
-        model_trained_at=metadata.get("trained_at"),
+        model_trained_at=str(trained_at) if trained_at else None,
         days=days,
     )
