@@ -54,6 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: ${{ vars.DEPLOY_ENVIRONMENT || 'production' }}
+    outputs:
+      deploy_url: ${{ steps.publish.outputs.deploy_url }}
 
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -81,25 +83,94 @@ jobs:
         run: npm install --global "vercel@${VERCEL_CLI_VERSION}"
 
       - name: Deploy to Vercel production
+        id: publish
         run: |
           vercel deploy --prod --yes --token "$VERCEL_TOKEN" > deploy-output.txt
           url=$(tail -n 1 deploy-output.txt)
           echo "Deployed to $url"
           echo "DEPLOY_URL=$url" >> "$GITHUB_ENV"
+          echo "deploy_url=$url" >> "$GITHUB_OUTPUT"
 
       - name: Check that the API answers with models in memory
         run: |
           for attempt in $(seq 1 30); do
-            if health=$(curl -fsS --max-time 60 "$DEPLOY_URL/health" 2>/dev/null); then
-              loaded=$(printf '%s' "$health" | jq -r '.models_loaded')
-              if [ "$loaded" -ge 1 ]; then
-                echo "$health"
-                echo "The API is live at $DEPLOY_URL with $loaded model(s) in memory."
-                exit 0
-              fi
+            status=$(curl -s -o health.json -w '%{http_code}' --max-time 60 "$DEPLOY_URL/health" || echo "000")
+            if [ "$status" = "200" ] && jq -e '.models_loaded >= 1' health.json > /dev/null 2>&1; then
+              echo "$(cat health.json)"
+              echo "The API is live at $DEPLOY_URL with models in memory."
+              exit 0
             fi
-            echo "Attempt $attempt of 30: the API is not ready or has no models yet."
+            if [ "$status" = "302" ] || [ "$status" = "401" ] || [ "$status" = "403" ]; then
+              echo "The deployment answered HTTP $status: Vercel Authentication is blocking the public URL."
+              echo "Turn off Deployment Protection for production in the project settings (Settings > Deployment Protection), then run the deploy again."
+              exit 1
+            fi
+            echo "Attempt $attempt of 30: HTTP $status, the API is not ready or has no models yet."
             sleep 10
           done
           echo "The API did not report any model in memory."
           exit 1
+
+  report:
+    name: Deploy report and access links
+    needs:
+      - validate-train-run
+      - deploy
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      DEPLOY_RESULT: ${{ needs.deploy.result }}
+      DEPLOY_URL: ${{ needs.deploy.outputs.deploy_url }}
+      TRAIN_RUN_ID: ${{ inputs.train_run_id }}
+      COMMIT_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Write the deploy report to the run summary
+        run: |
+          {
+            echo "## Relatório do deploy"
+            echo ""
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Resultado do deploy | $DEPLOY_RESULT |"
+            echo "| Train run id usado | \`$TRAIN_RUN_ID\` |"
+            echo "| Commit publicado | \`${COMMIT_SHA:0:7}\` |"
+            echo "| Data (UTC) | $(date -u '+%Y-%m-%d %H:%M') |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$DEPLOY_URL" ]; then
+            echo "**O deploy não gerou uma URL.** Veja o job *Publish the API on Vercel*." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          health=$(curl -s --max-time 60 "$DEPLOY_URL/health" | jq -c . 2>/dev/null || echo "sem JSON: a proteção de deploy pode estar ativa")
+          models=$(curl -s --max-time 60 "$DEPLOY_URL/models" | jq -c . 2>/dev/null || echo "sem JSON: a proteção de deploy pode estar ativa")
+          {
+            echo "## Acesso à API"
+            echo ""
+            echo "| Endpoint | Link |"
+            echo "|---|---|"
+            echo "| Documentação interativa (Swagger) | [$DEPLOY_URL/docs]($DEPLOY_URL/docs) |"
+            echo "| Saúde do serviço | [$DEPLOY_URL/health]($DEPLOY_URL/health) |"
+            echo "| Modelos em memória | [$DEPLOY_URL/models]($DEPLOY_URL/models) |"
+            echo "| Previsão (POST) | \`$DEPLOY_URL/predict\` |"
+            echo ""
+            echo "### Estado atual"
+            echo ""
+            echo "Saúde: \`$health\`"
+            echo ""
+            echo "Modelos: \`$models\`"
+            echo ""
+            echo "### Exemplo de previsão"
+            echo ""
+            echo '```bash'
+            echo "curl -X POST $DEPLOY_URL/predict \\"
+            echo '  -H "Content-Type: application/json" \'
+            echo "  -d '{\"ticker\": \"AAPL\", \"last_n_days\": 5}'"
+            echo '```'
+            echo ""
+            echo "Se a página responder com redirecionamento de login, desative a proteção de deploy (Vercel Authentication) para a produção."
+          } >> "$GITHUB_STEP_SUMMARY"

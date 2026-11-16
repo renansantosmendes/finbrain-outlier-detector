@@ -230,3 +230,6 @@ junit-unit.xml
 
 # Weights & Biases local run folders
 wandb/
+
+.vercel
+.env*
