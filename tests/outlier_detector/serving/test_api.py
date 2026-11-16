@@ -171,3 +171,48 @@ def test_startup_logs_the_models_that_were_loaded(
         "Startup loaded 1 of 2 model(s): loaded=['AAPL']" in message
         for message in messages
     )
+
+
+def test_startup_discovers_the_models_when_no_ticker_is_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OUTLIER_TICKERS", raising=False)
+    monkeypatch.setenv("WANDB_API_KEY", "test-key")
+    requested = []
+    monkeypatch.setattr(
+        WandbModelRegistry,
+        "list_trained_tickers",
+        lambda self: ["AAPL"],
+    )
+    monkeypatch.setattr(
+        WandbModelRegistry,
+        "load_all",
+        lambda self, tickers: requested.extend(tickers) or tickers,
+    )
+    registry = WandbModelRegistry(
+        entity="team",
+        download_directory=tmp_path,
+        env_file_path=str(tmp_path / "missing.env"),
+    )
+    create_app(registry=registry)
+    assert requested == ["AAPL"]
+
+
+def test_startup_skips_discovery_without_a_wandb_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OUTLIER_TICKERS", raising=False)
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr(
+        WandbModelRegistry,
+        "list_trained_tickers",
+        lambda self: pytest.fail("discovery must not run without a key"),
+    )
+    registry = WandbModelRegistry(
+        entity="team",
+        download_directory=tmp_path,
+        env_file_path=str(tmp_path / "missing.env"),
+    )
+    assert create_app(registry=registry) is not None

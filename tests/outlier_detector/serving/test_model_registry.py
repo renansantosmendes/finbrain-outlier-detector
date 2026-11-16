@@ -1,6 +1,7 @@
 """Tests of the in-memory model registry, with wandb mocked."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -130,3 +131,86 @@ def test_project_path_uses_the_configured_entity(
 def test_default_download_directory_is_a_temporary_folder() -> None:
     default = WandbModelRegistry(entity="team")
     assert default.download_directory.name == "outlier-detector-artifacts"
+
+
+class FakeProjectApi:
+    """Stand-in for ``wandb.Api`` that lists one project's models.
+
+    Parameters
+    ----------
+    collections : list[SimpleNamespace]
+        Collections returned for the model type.
+    metadata_by_name : dict[str, dict[str, object]]
+        Metadata of each collection, looked up by name.
+    """
+
+    def __init__(
+        self,
+        collections: list[SimpleNamespace],
+        metadata_by_name: dict[str, dict[str, object]],
+    ) -> None:
+        self.collections = collections
+        self.metadata_by_name = metadata_by_name
+
+    def artifact_collections(
+        self,
+        project_name: str,
+        type_name: str,
+    ) -> list[SimpleNamespace]:
+        """Return the fake collections of the project.
+
+        Parameters
+        ----------
+        project_name : str
+            Ignored project path.
+        type_name : str
+            Ignored artifact type.
+
+        Returns
+        -------
+        list[SimpleNamespace]
+            The fake collections.
+        """
+        return self.collections
+
+    def artifact(self, path: str, **options: str) -> SimpleNamespace:
+        """Return the metadata of the collection named in the path.
+
+        Parameters
+        ----------
+        path : str
+            Path ending in ``<collection>:latest``.
+        options : str
+            Ignored keyword options, including the artifact type.
+
+        Returns
+        -------
+        SimpleNamespace
+            Artifact with the collection's metadata.
+        """
+        name = path.split("/")[-1].split(":")[0]
+        return SimpleNamespace(metadata=self.metadata_by_name[name])
+
+
+def test_list_trained_tickers_reads_the_ticker_from_each_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = WandbModelRegistry(entity="team", download_directory=tmp_path)
+    fake_api = FakeProjectApi(
+        collections=[
+            SimpleNamespace(name="outlier-detector-aapl"),
+            SimpleNamespace(name="unrelated-model"),
+            SimpleNamespace(name="outlier-detector-petr4.sa"),
+        ],
+        metadata_by_name={
+            "outlier-detector-aapl": {"ticker": "AAPL"},
+            "outlier-detector-petr4.sa": {"ticker": "PETR4.SA"},
+        },
+    )
+    monkeypatch.setattr(
+        WandbModelRegistry,
+        "api",
+        property(lambda self: fake_api),
+    )
+    assert registry.list_trained_tickers() == ["AAPL", "PETR4.SA"]

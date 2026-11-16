@@ -13,6 +13,8 @@ import logging
 import os
 import time
 
+import wandb
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 
 from outlier_detector.serving.model_registry import (
@@ -82,6 +84,35 @@ def configure_logging() -> None:
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 
+def discover_tickers(registry: WandbModelRegistry) -> list[str]:
+    """Find the tickers with a model in W&B when none is configured.
+
+    The W&B key is read from the environment or from the registry's ``.env``
+    file. Without a key, no call is made and the list is empty, so the
+    application still starts, as in tests and in the CI smoke test.
+
+    Parameters
+    ----------
+    registry : WandbModelRegistry
+        Registry used to list the trained tickers.
+
+    Returns
+    -------
+    list[str]
+        Tickers found in the W&B project, or an empty list.
+    """
+    load_dotenv(dotenv_path=registry.env_file_path)
+    if not os.environ.get("WANDB_API_KEY"):
+        logger.info("No OUTLIER_TICKERS and no WANDB_API_KEY: no discovery.")
+        return []
+    logger.info("No OUTLIER_TICKERS: discovering the models in W&B.")
+    try:
+        return registry.list_trained_tickers()
+    except (wandb.errors.CommError, ValueError, OSError) as error:
+        logger.error("Could not list the models in W&B: %s", error)
+        return []
+
+
 def create_app(
     registry: WandbModelRegistry | None = None,
     tickers: list[str] | None = None,
@@ -108,7 +139,11 @@ def create_app(
     """
     configure_logging()
     active_registry = registry or build_default_registry()
-    startup_tickers = configured_tickers() if tickers is None else tickers
+    startup_tickers = (
+        configured_tickers() or discover_tickers(active_registry)
+        if tickers is None
+        else tickers
+    )
     if startup_tickers:
         loaded_tickers = active_registry.load_all(startup_tickers)
         logger.info(
@@ -119,7 +154,7 @@ def create_app(
             startup_tickers,
         )
     else:
-        logger.info("Startup without models: OUTLIER_TICKERS is empty.")
+        logger.warning("Startup without models: no ticker was found to load.")
 
     application = FastAPI(
         title="Outlier Detector API",

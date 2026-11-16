@@ -11,7 +11,10 @@ import wandb
 from outlier_detector.models.isolation_forest_detector import (
     IsolationForestDetector,
 )
-from outlier_detector.registry.wandb_model_store import download_detector
+from outlier_detector.registry.wandb_model_store import (
+    ARTIFACT_PREFIX,
+    download_detector,
+)
 
 DEFAULT_PROJECT_NAME = "outlier-detector"
 
@@ -148,6 +151,35 @@ class WandbModelRegistry:
         )
         self.models[ticker] = loaded
         return loaded
+
+    def list_trained_tickers(self) -> list[str]:
+        """Discover the tickers that have a model in the W&B project.
+
+        Each collection whose name starts with the detector prefix is read
+        at its latest version, and the ticker comes from the metadata stored
+        with the artifact.
+
+        Returns
+        -------
+        list[str]
+            Tickers found in the project, in alphabetical order.
+        """
+        tickers = []
+        collections = self.api.artifact_collections(
+            project_name=self.project_path,
+            type_name="model",
+        )
+        for collection in collections:
+            if not collection.name.startswith(ARTIFACT_PREFIX):
+                continue
+            artifact = self.api.artifact(
+                f"{self.project_path}/{collection.name}:latest",
+                type="model",
+            )
+            ticker = artifact.metadata.get("ticker")
+            if ticker:
+                tickers.append(ticker)
+        return sorted(tickers)
 
     def load_all(self, tickers: list[str]) -> list[str]:
         """Load the detectors of several tickers, skipping the failures.
