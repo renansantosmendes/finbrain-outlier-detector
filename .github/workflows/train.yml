@@ -8,15 +8,15 @@ on:
         required: true
         default: "AAPL"
         type: string
-      period:
-        description: "Price history given to yfinance, for example 3y or 5y"
+      start:
+        description: "First date of the price history, in YYYY-MM-DD"
         required: true
-        default: "3y"
+        default: "2020-01-01"
         type: string
       contamination:
-        description: "Expected share of atypical days, between 0 and 0.5"
+        description: "Expected share of outliers in each training window"
         required: true
-        default: 0.02
+        default: 0.1
         type: number
       random_seed:
         description: "Seed of the Isolation Forest"
@@ -86,17 +86,17 @@ jobs:
           exit 1
 
   plan:
-    name: Check the tickers
+    name: Check the tickers and the W&B key
     needs: ci-check
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     outputs:
-      tickers: ${{ steps.parse.outputs.tickers }}
       tickers_csv: ${{ steps.parse.outputs.tickers_csv }}
 
     env:
       TICKERS_INPUT: ${{ inputs.tickers }}
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
 
     steps:
       - name: Parse and validate the ticker list
@@ -112,54 +112,53 @@ jobs:
             exit 1
           fi
 
-          tickers_json=$(printf '%s' "$TICKERS_INPUT" | tr ',' '\n' \
+          tickers_csv=$(printf '%s' "$TICKERS_INPUT" | tr ',' '\n' \
             | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
             | grep -v '^$' \
-            | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          if [ "$(printf '%s' "$tickers_json" | jq 'length')" -lt 1 ]; then
+            | paste -sd, -)
+          if [ -z "$tickers_csv" ]; then
             echo "No ticker symbol was given."
             exit 1
           fi
-
-          tickers_csv=$(printf '%s' "$tickers_json" | jq -r 'join(",")')
-          echo "tickers=$tickers_json" >> "$GITHUB_OUTPUT"
           echo "tickers_csv=$tickers_csv" >> "$GITHUB_OUTPUT"
           echo "Tickers to train: $tickers_csv"
 
+      - name: Require a W&B API key
+        run: |
+          if [ -z "$WANDB_API_KEY" ]; then
+            echo "A W&B API key is required: set the WANDB_API_KEY secret."
+            exit 1
+          fi
+          echo "A W&B API key was found."
+
   train:
-    name: Train the detectors
+    name: Train and register the detectors in W&B
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     env:
       TICKERS: ${{ needs.plan.outputs.tickers_csv }}
-      PERIOD: ${{ inputs.period }}
+      START: ${{ inputs.start }}
       CONTAMINATION: ${{ inputs.contamination }}
       RANDOM_SEED: ${{ inputs.random_seed }}
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Hide the W&B API key from the logs
+        run: echo "::add-mask::$WANDB_API_KEY"
+
       - name: Set up Python and uv
         uses: ./.github/actions/setup-python-uv
 
-      - name: Train one detector per ticker
+      - name: Train one detector per ticker and register it
         run: >
           uv run python -m outlier_detector.training.train
           --tickers "$TICKERS"
-          --period "$PERIOD"
+          --start "$START"
           --contamination "$CONTAMINATION"
           --random-seed "$RANDOM_SEED"
-          --model-directory models
-
-      - name: Upload the trained models and their metadata
-        uses: actions/upload-artifact@v4
-        with:
-          name: trained-models
-          path: |
-            models/*.joblib
-            models/*.json
-          if-no-files-found: error
-          retention-days: 30
+          --wandb-project outlier-detector

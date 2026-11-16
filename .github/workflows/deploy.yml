@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       train_run_id:
-        description: "Run id of a successful Train workflow. Its trained models are published with the API."
+        description: "Run id of a successful Train workflow. The API loads its models from W&B, so the run must have registered them."
         required: true
         type: string
 
@@ -56,11 +56,9 @@ jobs:
     environment: ${{ vars.DEPLOY_ENVIRONMENT || 'production' }}
 
     env:
-      TRAIN_RUN_ID: ${{ inputs.train_run_id }}
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
       VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Check the Vercel configuration
@@ -73,22 +71,6 @@ jobs:
 
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Download the trained models of the Train run
-        uses: actions/download-artifact@v4
-        with:
-          name: trained-models
-          path: models
-          run-id: ${{ inputs.train_run_id }}
-          github-token: ${{ github.token }}
-
-      - name: List the models that will be published
-        run: |
-          ls -l models
-          if [ -z "$(ls models/*.joblib 2>/dev/null)" ]; then
-            echo "The Train run did not produce any model."
-            exit 1
-          fi
 
       - name: Set up Node.js for the Vercel CLI
         uses: actions/setup-node@v4
@@ -105,19 +87,19 @@ jobs:
           echo "Deployed to $url"
           echo "DEPLOY_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Check that the API answers and has models
+      - name: Check that the API answers with models in memory
         run: |
           for attempt in $(seq 1 30); do
-            if curl -fsS --max-time 20 "$DEPLOY_URL/health" > /dev/null 2>&1; then
-              models=$(curl -fsS --max-time 20 "$DEPLOY_URL/models")
-              if [ "$(printf '%s' "$models" | jq '.tickers | length')" -ge 1 ]; then
-                echo "$models"
-                echo "The API is live at $DEPLOY_URL"
+            if health=$(curl -fsS --max-time 60 "$DEPLOY_URL/health" 2>/dev/null); then
+              loaded=$(printf '%s' "$health" | jq -r '.models_loaded')
+              if [ "$loaded" -ge 1 ]; then
+                echo "$health"
+                echo "The API is live at $DEPLOY_URL with $loaded model(s) in memory."
                 exit 0
               fi
             fi
-            echo "Attempt $attempt of 30: the API is not ready yet."
+            echo "Attempt $attempt of 30: the API is not ready or has no models yet."
             sleep 10
           done
-          echo "The API did not answer with a trained model."
+          echo "The API did not report any model in memory."
           exit 1
