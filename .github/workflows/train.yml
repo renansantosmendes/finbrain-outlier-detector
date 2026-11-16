@@ -162,3 +162,52 @@ jobs:
           --contamination "$CONTAMINATION"
           --random-seed "$RANDOM_SEED"
           --wandb-project outlier-detector
+
+  report:
+    name: Training report and deploy instructions
+    needs:
+      - plan
+      - train
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      TRAIN_RESULT: ${{ needs.train.result }}
+      TICKERS: ${{ needs.plan.outputs.tickers_csv }}
+      START: ${{ inputs.start }}
+      CONTAMINATION: ${{ inputs.contamination }}
+      RANDOM_SEED: ${{ inputs.random_seed }}
+      TRAIN_RUN_ID: ${{ github.run_id }}
+
+    steps:
+      - name: Write the training report to the run summary
+        run: |
+          {
+            echo "## Relatório do treinamento"
+            echo ""
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| **Train run id** | \`$TRAIN_RUN_ID\` |"
+            echo "| Resultado do treino | $TRAIN_RESULT |"
+            echo "| Tickers | ${TICKERS:-não informado} |"
+            echo "| Início do histórico | $START |"
+            echo "| Contaminação | $CONTAMINATION |"
+            echo "| Semente aleatória | $RANDOM_SEED |"
+            echo "| Projeto no W&B | outlier-detector |"
+            echo ""
+            echo "## Próximo passo"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$TRAIN_RESULT" = "success" ]; then
+            {
+              echo "Treino concluído. Rode o workflow **03 - Deploy API to Vercel** com \`train_run_id = $TRAIN_RUN_ID\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Train run id for the deploy: $TRAIN_RUN_ID"
+          else
+            {
+              echo "**O treino não terminou com sucesso** (resultado: $TRAIN_RESULT). Não faça o deploy com este run id."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
