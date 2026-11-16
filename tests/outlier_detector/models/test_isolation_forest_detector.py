@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
@@ -71,3 +72,19 @@ def test_save_and_load_give_the_same_scores(tmp_path: Path) -> None:
         detector.score_days(training.head(20)),
         loaded.score_days(training.head(20)),
     )
+
+
+def test_saved_file_is_a_plain_dictionary(tmp_path: Path) -> None:
+    detector = IsolationForestDetector().fit(make_training_frame())
+    path = tmp_path / "detector.joblib"
+    detector.save(path)
+    stored = joblib.load(path)
+    assert isinstance(stored, dict)
+    assert stored["feature_columns"] == ["a", "b"]
+    assert set(stored) == {
+        "forest",
+        "feature_columns",
+        "contamination",
+        "n_estimators",
+        "random_seed",
+    }

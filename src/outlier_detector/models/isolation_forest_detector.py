@@ -109,12 +109,25 @@ class IsolationForestDetector:
     def save(self, path: Path) -> None:
         """Write the fitted detector to a joblib file.
 
+        The file holds a plain dictionary with the sklearn model and the
+        settings, not a pickled instance of this class. Any environment can
+        read it, including the notebooks that define their own detector.
+
         Parameters
         ----------
         path : Path
             Destination file. Its parent directory must exist.
         """
-        joblib.dump(self, path)
+        joblib.dump(
+            {
+                "forest": self.forest,
+                "feature_columns": self.feature_columns,
+                "contamination": self.contamination,
+                "n_estimators": self.n_estimators,
+                "random_seed": self.random_seed,
+            },
+            path,
+        )
 
     @staticmethod
     def load(path: Path) -> "IsolationForestDetector":
@@ -128,6 +141,14 @@ class IsolationForestDetector:
         Returns
         -------
         IsolationForestDetector
-            The stored detector.
+            The stored detector, ready to score.
         """
-        return joblib.load(path)
+        stored = joblib.load(path)
+        detector = IsolationForestDetector(
+            contamination=stored["contamination"],
+            n_estimators=stored["n_estimators"],
+            random_seed=stored["random_seed"],
+        )
+        detector.forest = stored["forest"]
+        detector.feature_columns = stored["feature_columns"]
+        return detector
