@@ -90,15 +90,18 @@ jobs:
       - name: Check that the API answers with models in memory
         run: |
           for attempt in $(seq 1 30); do
-            if health=$(curl -fsS --max-time 60 "$DEPLOY_URL/health" 2>/dev/null); then
-              loaded=$(printf '%s' "$health" | jq -r '.models_loaded')
-              if [ "$loaded" -ge 1 ]; then
-                echo "$health"
-                echo "The API is live at $DEPLOY_URL with $loaded model(s) in memory."
-                exit 0
-              fi
+            status=$(curl -s -o health.json -w '%{http_code}' --max-time 60 "$DEPLOY_URL/health" || echo "000")
+            if [ "$status" = "200" ] && jq -e '.models_loaded >= 1' health.json > /dev/null 2>&1; then
+              echo "$(cat health.json)"
+              echo "The API is live at $DEPLOY_URL with models in memory."
+              exit 0
             fi
-            echo "Attempt $attempt of 30: the API is not ready or has no models yet."
+            if [ "$status" = "302" ] || [ "$status" = "401" ] || [ "$status" = "403" ]; then
+              echo "The deployment answered HTTP $status: Vercel Authentication is blocking the public URL."
+              echo "Turn off Deployment Protection for production in the project settings (Settings > Deployment Protection), then run the deploy again."
+              exit 1
+            fi
+            echo "Attempt $attempt of 30: HTTP $status, the API is not ready or has no models yet."
             sleep 10
           done
           echo "The API did not report any model in memory."
