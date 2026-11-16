@@ -150,7 +150,8 @@ jobs:
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
           client = TestClient(module.app)
-          assert client.get('/health').json() == {'status': 'ok'}
+          health = client.get('/health').json()
+          assert health['status'] == 'ok'
           assert client.get('/models').status_code == 200
           print('ok: entry point serves /health and /models')
           "

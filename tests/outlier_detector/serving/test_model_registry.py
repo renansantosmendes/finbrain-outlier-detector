@@ -86,6 +86,11 @@ def registry(
         return make_detector(), {"trained_at": "2026-01-01T00:00:00+00:00"}
 
     monkeypatch.setattr(model_registry, "download_detector", fake_download)
+    monkeypatch.setattr(
+        WandbModelRegistry,
+        "api",
+        property(lambda self: object()),
+    )
     return WandbModelRegistry(
         entity="team",
         download_directory=tmp_path,
