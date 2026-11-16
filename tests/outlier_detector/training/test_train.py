@@ -101,7 +101,7 @@ def test_train_ticker_registers_the_model_and_finishes_the_run(
     assert tracker.config["ticker"] == "AAPL"
     assert tracker.models[0]["model_name"] == "outlier-detector-aapl"
     assert metadata["ticker"] == "AAPL"
-    assert metadata["feature_columns"][0] == "ret"
+    assert metadata["feature_columns"][0] == "log_return"
 
 
 def test_train_ticker_logs_the_walk_forward_metrics(

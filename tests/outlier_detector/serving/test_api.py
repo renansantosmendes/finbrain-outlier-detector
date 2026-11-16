@@ -125,3 +125,49 @@ def test_build_default_registry_reads_the_project(
     registry = api.build_default_registry()
     assert registry.project_name == "my-project"
     assert registry.entity == "my-team"
+
+
+def test_predict_logs_the_served_prediction(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("INFO", logger="outlier_detector.serving.api"):
+        client.post("/predict", json={"ticker": "AAPL", "last_n_days": 2})
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Prediction served: ticker=AAPL last_n_days=2 days=2" in message
+        for message in messages
+    )
+
+
+def test_predict_logs_a_warning_for_a_missing_model(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="outlier_detector.serving.api"):
+        client.post("/predict", json={"ticker": "NOPE"})
+    warnings = [
+        record for record in caplog.records if record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "ticker=NOPE" in warnings[0].getMessage()
+
+
+def test_startup_logs_the_models_that_were_loaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        WandbModelRegistry,
+        "load_all",
+        lambda self, tickers: ["AAPL"],
+    )
+    registry = WandbModelRegistry(entity="team", download_directory=tmp_path)
+    with caplog.at_level("INFO", logger="outlier_detector.serving.api"):
+        create_app(registry=registry, tickers=["AAPL", "NOPE"])
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "Startup loaded 1 of 2 model(s): loaded=['AAPL']" in message
+        for message in messages
+    )

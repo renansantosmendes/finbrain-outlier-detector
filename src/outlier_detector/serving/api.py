@@ -9,7 +9,9 @@ Run it locally from the project root::
     uv run uvicorn api.index:app --reload
 """
 
+import logging
 import os
+import time
 
 from fastapi import FastAPI, HTTPException
 
@@ -28,6 +30,9 @@ from outlier_detector.serving.service import detect_atypical_days
 TICKERS_VARIABLE = "OUTLIER_TICKERS"
 PROJECT_VARIABLE = "OUTLIER_WANDB_PROJECT"
 ENTITY_VARIABLE = "WANDB_ENTITY"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+logger = logging.getLogger(__name__)
 
 
 def configured_tickers() -> list[str]:
@@ -65,6 +70,18 @@ def build_default_registry() -> WandbModelRegistry:
     )
 
 
+def configure_logging() -> None:
+    """Send the application logs to stderr at INFO level when unconfigured.
+
+    Hosts such as Vercel do not configure the root logger, so without this
+    call the INFO messages of the API would be dropped. When the root logger
+    already has handlers, for example under uvicorn, nothing changes.
+    """
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+
+
 def create_app(
     registry: WandbModelRegistry | None = None,
     tickers: list[str] | None = None,
@@ -89,10 +106,20 @@ def create_app(
     -------
     >>> app = create_app(tickers=[])  # doctest: +SKIP
     """
+    configure_logging()
     active_registry = registry or build_default_registry()
     startup_tickers = configured_tickers() if tickers is None else tickers
     if startup_tickers:
-        active_registry.load_all(startup_tickers)
+        loaded_tickers = active_registry.load_all(startup_tickers)
+        logger.info(
+            "Startup loaded %d of %d model(s): loaded=%s requested=%s",
+            len(loaded_tickers),
+            len(startup_tickers),
+            loaded_tickers,
+            startup_tickers,
+        )
+    else:
+        logger.info("Startup without models: OUTLIER_TICKERS is empty.")
 
     application = FastAPI(
         title="Outlier Detector API",
@@ -145,11 +172,32 @@ def create_app(
             404 when no detector is in memory for the ticker, 422 when the
             market data does not allow building the features.
         """
+        started_at = time.perf_counter()
         try:
-            return detect_atypical_days(request, active_registry)
+            response = detect_atypical_days(request, active_registry)
         except ModelNotFoundError as error:
+            logger.warning(
+                "Prediction rejected: no model in memory for ticker=%s",
+                request.ticker,
+            )
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
+            logger.warning(
+                "Prediction rejected: insufficient data for ticker=%s: %s",
+                request.ticker,
+                error,
+            )
             raise HTTPException(status_code=422, detail=str(error)) from error
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        logger.info(
+            "Prediction served: ticker=%s last_n_days=%d days=%d "
+            "atypical_days=%d duration_ms=%.1f",
+            request.ticker,
+            request.last_n_days,
+            len(response.days),
+            sum(day.is_atypical for day in response.days),
+            duration_ms,
+        )
+        return response
 
     return application
