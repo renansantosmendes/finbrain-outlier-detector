@@ -1,70 +1,71 @@
-"""Walk-forward scores: each day is judged with a model fitted on the past."""
+"""Walk-forward scores: each block is judged with a model fitted on the
+past."""
 
-import numpy as np
 import pandas as pd
 
 from outlier_detector.models.isolation_forest_detector import (
+    DEFAULT_CONTAMINATION,
+    DEFAULT_N_ESTIMATORS,
+    DEFAULT_RANDOM_SEED,
     IsolationForestDetector,
 )
 
-TRAIN_WINDOW = 252
-REFIT_EVERY = 21
+TRAIN_MIN = 252 * 3
+STEP = 126
 
 
 def walk_forward_scores(
     features: pd.DataFrame,
-    train_window: int = TRAIN_WINDOW,
-    refit_every: int = REFIT_EVERY,
-    contamination: float = 0.02,
-    random_seed: int = 42,
-) -> pd.Series:
-    """Score every day using only the rows that came before it.
+    train_min: int = TRAIN_MIN,
+    step: int = STEP,
+    contamination: float = DEFAULT_CONTAMINATION,
+    n_estimators: int = DEFAULT_N_ESTIMATORS,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+) -> pd.DataFrame:
+    """Score every day after ``train_min`` using only the days before it.
 
-    A detector is fitted on the ``train_window`` rows before a block and
-    then scores the next ``refit_every`` rows. The process repeats until
-    the end of ``features``, so no score uses future data.
+    The detector is refitted on all the rows before each block of ``step``
+    days, and then scores that block, which it has not seen. The training
+    window grows over time, so no score uses future data.
 
     Parameters
     ----------
     features : pd.DataFrame
         Feature rows sorted by date, without missing values.
-    train_window : int, optional
-        Number of rows in each training window. The default is 252, about
-        one trading year.
-    refit_every : int, optional
+    train_min : int, optional
+        Number of rows in the first training window. The default is
+        ``TRAIN_MIN``, about three trading years.
+    step : int, optional
         Number of rows scored before the detector is refitted. The default
-        is 21, about one trading month.
+        is ``STEP``, about six months of trading days.
     contamination : float, optional
-        Expected share of atypical rows, passed to the detector. The
-        default is 0.02.
+        Expected share of outliers. The default is 0.1.
+    n_estimators : int, optional
+        Number of isolation trees. The default is 300.
     random_seed : int, optional
         Seed of the detectors. The default is 42.
 
     Returns
     -------
-    pd.Series
-        Scores for the rows after the first ``train_window``, indexed like
-        ``features``. Empty when there are not enough rows.
+    pd.DataFrame
+        Scores of the rows from ``train_min`` onwards, with the columns
+        ``score`` and ``is_atypical``. Empty when there are not enough rows.
 
     Example
     -------
-    >>> import numpy as np
-    >>> import pandas as pd
-    >>> rng = np.random.default_rng(1)
-    >>> features = pd.DataFrame(rng.normal(size=(300, 2)), columns=["a", "b"])
-    >>> walk_forward_scores(features, train_window=200).shape
-    (100,)
+    >>> walk_forward_scores(features, train_min=200, step=20)  # doctest: +SKIP
     """
-    scores = pd.Series(np.nan, index=features.index)
-    for block_start in range(train_window, len(features), refit_every):
-        block_end = min(block_start + refit_every, len(features))
-        training_rows = features.iloc[block_start - train_window : block_start]
-        block_rows = features.iloc[block_start:block_end]
+    blocks = []
+    for block_start in range(train_min, len(features), step):
+        block_end = min(block_start + step, len(features))
         detector = IsolationForestDetector(
             contamination=contamination,
+            n_estimators=n_estimators,
             random_seed=random_seed,
-        ).fit(training_rows)
-        scores.iloc[block_start:block_end] = detector.decision_scores(
-            block_rows
-        ).to_numpy()
-    return scores.dropna()
+        ).fit(features.iloc[:block_start])
+        blocks.append(
+            detector.score_days(features.iloc[block_start:block_end])
+        )
+    if not blocks:
+        return pd.DataFrame(columns=["score", "is_atypical"])
+    return pd.concat(blocks)

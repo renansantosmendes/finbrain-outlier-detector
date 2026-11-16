@@ -28,33 +28,37 @@ def test_fit_records_the_feature_columns() -> None:
     assert detector.feature_columns == ["a", "b"]
 
 
-def test_extreme_row_gets_a_negative_score() -> None:
-    detector = IsolationForestDetector(contamination=0.02)
-    detector.fit(make_training_frame())
-    extreme = pd.DataFrame({"a": [50.0], "b": [-50.0]})
-    scores = detector.decision_scores(extreme)
-    assert scores.iloc[0] < 0
-    assert detector.is_atypical(scores).iloc[0]
+def test_extreme_row_gets_the_highest_score() -> None:
+    training = make_training_frame()
+    detector = IsolationForestDetector().fit(training)
+    rows = pd.concat(
+        [training.head(5), pd.DataFrame({"a": [50.0], "b": [-50.0]})],
+        ignore_index=True,
+    )
+    scores = detector.score_days(rows)
+    assert scores["score"].idxmax() == 5
+    assert bool(scores.loc[5, "is_atypical"])
+
+
+def test_score_days_returns_score_and_label_columns() -> None:
+    training = make_training_frame()
+    detector = IsolationForestDetector().fit(training)
+    result = detector.score_days(training.tail(4))
+    assert list(result.columns) == ["score", "is_atypical"]
+    assert result.index.equals(training.tail(4).index)
 
 
 def test_typical_rows_are_mostly_not_flagged() -> None:
     training = make_training_frame()
-    detector = IsolationForestDetector().fit(training)
-    flags = detector.is_atypical(detector.decision_scores(training))
-    assert flags.mean() < 0.1
+    detector = IsolationForestDetector(contamination=0.05).fit(training)
+    flags = detector.score_days(training)["is_atypical"]
+    assert flags.mean() < 0.2
 
 
-def test_decision_scores_keep_the_index() -> None:
-    training = make_training_frame()
-    detector = IsolationForestDetector().fit(training)
-    rows = training.tail(5)
-    assert detector.decision_scores(rows).index.equals(rows.index)
-
-
-def test_decision_scores_reject_different_columns() -> None:
+def test_score_days_reject_different_columns() -> None:
     detector = IsolationForestDetector().fit(make_training_frame())
     with pytest.raises(ValueError, match="feature columns differ"):
-        detector.decision_scores(pd.DataFrame({"a": [1.0], "c": [2.0]}))
+        detector.score_days(pd.DataFrame({"a": [1.0], "c": [2.0]}))
 
 
 def test_save_and_load_give_the_same_scores(tmp_path: Path) -> None:
@@ -63,7 +67,7 @@ def test_save_and_load_give_the_same_scores(tmp_path: Path) -> None:
     path = tmp_path / "detector.joblib"
     detector.save(path)
     loaded = IsolationForestDetector.load(path)
-    pd.testing.assert_series_equal(
-        detector.decision_scores(training.head(20)),
-        loaded.decision_scores(training.head(20)),
+    pd.testing.assert_frame_equal(
+        detector.score_days(training.head(20)),
+        loaded.score_days(training.head(20)),
     )

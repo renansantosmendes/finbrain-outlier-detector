@@ -1,135 +1,197 @@
-"""Train one Isolation Forest detector per ticker and store it.
+"""Train one Isolation Forest per ticker and register it in Weights & Biases.
 
 Run the command from the project root, for example::
 
     uv run python -m outlier_detector.training.train --tickers PETR4.SA,AAPL
 
-For each ticker the command downloads the prices, builds the features,
-evaluates the detector with walk-forward scores and stores the detector
-fitted on all the features, together with a JSON file of metadata.
+Each ticker is one wandb run. The run logs the walk-forward evaluation as
+metrics and registers the detector, fitted on all the features, as a model
+artifact. The API downloads that artifact when it starts.
 """
 
 import argparse
 import logging
+import tempfile
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
-import pandas as pd
-
-from outlier_detector.data.market_data import load_prices
+from outlier_detector.data.market_data import (
+    DEFAULT_BENCHMARK,
+    load_benchmark_log_returns,
+    load_earnings_days,
+    load_prices,
+)
 from outlier_detector.features.price_features import (
     FEATURE_COLUMNS,
     build_features,
 )
-from outlier_detector.models.artifact_store import save_model
 from outlier_detector.models.isolation_forest_detector import (
+    DEFAULT_CONTAMINATION,
+    DEFAULT_N_ESTIMATORS,
+    DEFAULT_RANDOM_SEED,
     IsolationForestDetector,
 )
 from outlier_detector.models.walk_forward import (
-    REFIT_EVERY,
-    TRAIN_WINDOW,
+    STEP,
+    TRAIN_MIN,
     walk_forward_scores,
 )
+from outlier_detector.registry.wandb_model_store import log_detector
+from outlier_detector.tracking.wandb_tracker import WandbExperimentTracker
 
-DEFAULT_MODEL_DIRECTORY = Path("models")
-DEFAULT_PERIOD = "3y"
-DEFAULT_CONTAMINATION = 0.02
-DEFAULT_RANDOM_SEED = 42
+DEFAULT_PROJECT_NAME = "outlier-detector"
+DEFAULT_START = "2020-01-01"
 MODEL_FAMILY = "isolation_forest"
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class TrainingSettings:
+    """Hyperparameters and data settings of one training command.
+
+    Attributes
+    ----------
+    start : str
+        First date of the price history, in ``YYYY-MM-DD`` format.
+    benchmark : str
+        Benchmark index used for the excess return.
+    contamination : float
+        Expected share of outliers in each training window.
+    n_estimators : int
+        Number of isolation trees.
+    random_seed : int
+        Seed of the detectors.
+    train_min : int
+        Number of rows in the first training window.
+    step : int
+        Number of rows scored before the detector is refitted.
+    """
+
+    start: str = DEFAULT_START
+    benchmark: str = DEFAULT_BENCHMARK
+    contamination: float = DEFAULT_CONTAMINATION
+    n_estimators: int = DEFAULT_N_ESTIMATORS
+    random_seed: int = DEFAULT_RANDOM_SEED
+    train_min: int = TRAIN_MIN
+    step: int = STEP
+
+
 def train_ticker(
     ticker: str,
-    period: str,
-    model_directory: Path,
-    contamination: float,
-    random_seed: int,
-) -> dict[str, Any]:
-    """Fit the detector of one ticker, evaluate it and store it.
-
-    The stored detector is fitted on every feature row of the period. The
-    walk-forward evaluation only reports how many days it would have
-    flagged without looking at the future, so the metric is not a test
-    score.
+    settings: TrainingSettings,
+    project_name: str,
+    work_directory: Path,
+) -> dict[str, object]:
+    """Train the detector of one ticker and register it in wandb.
 
     Parameters
     ----------
     ticker : str
         Yahoo Finance symbol to train on.
-    period : str
-        Period of price history, for example ``3y``.
-    model_directory : Path
-        Folder where the detector and its metadata are stored.
-    contamination : float
-        Expected share of atypical days.
-    random_seed : int
-        Seed used by the detectors.
+    settings : TrainingSettings
+        Hyperparameters and data settings of the run.
+    project_name : str
+        wandb project where the run is logged.
+    work_directory : Path
+        Local folder where the detector file is written before upload.
 
     Returns
     -------
-    dict[str, Any]
-        Metadata saved next to the detector.
+    dict[str, object]
+        Metadata stored with the registered artifact.
 
-    Example
-    -------
-    >>> from pathlib import Path
-    >>> metadata = train_ticker(
-    ...     "AAPL", "3y", Path("models"), 0.02, 42
-    ... )  # doctest: +SKIP
-    >>> metadata["ticker"]  # doctest: +SKIP
-    'AAPL'
+    Raises
+    ------
+    ValueError
+        If there are not enough feature rows to train and evaluate.
     """
-    prices = load_prices(ticker, period=period)
-    features = build_features(prices)
-    detector = IsolationForestDetector(
-        contamination=contamination,
-        random_seed=random_seed,
-    ).fit(features)
-    walk_forward = walk_forward_scores(
-        features,
-        contamination=contamination,
-        random_seed=random_seed,
-    )
-    metadata = {
+    config = {
         "ticker": ticker,
         "model_family": MODEL_FAMILY,
-        "period": period,
-        "trained_at": datetime.now(timezone.utc).isoformat(),
-        "training_rows": len(features),
         "feature_columns": FEATURE_COLUMNS,
-        "contamination": contamination,
-        "n_estimators": detector.n_estimators,
-        "random_seed": random_seed,
-        "train_window": TRAIN_WINDOW,
-        "refit_every": REFIT_EVERY,
-        "walk_forward_rows": len(walk_forward),
-        "walk_forward_flagged_share": _flagged_share(walk_forward),
+        **asdict(settings),
     }
-    save_model(model_directory, ticker, detector, metadata)
-    logger.info("Stored the model of %s with %d rows.", ticker, len(features))
-    return metadata
+    tracker = WandbExperimentTracker(project_name=project_name, config=config)
+    tracker.start_run()
+    try:
+        return _train_and_register(ticker, settings, tracker, work_directory)
+    finally:
+        tracker.finish_run()
 
 
-def _flagged_share(scores: pd.Series) -> float | None:
-    """Return the share of negative scores, or None when there are none.
+def _train_and_register(
+    ticker: str,
+    settings: TrainingSettings,
+    tracker: WandbExperimentTracker,
+    work_directory: Path,
+) -> dict[str, object]:
+    """Fit, evaluate and register the detector of a ticker.
 
     Parameters
     ----------
-    scores : pd.Series
-        Walk-forward scores. A negative score marks an atypical day.
+    ticker : str
+        Yahoo Finance symbol to train on.
+    settings : TrainingSettings
+        Hyperparameters and data settings of the run.
+    tracker : WandbExperimentTracker
+        Tracker whose run is active.
+    work_directory : Path
+        Local folder where the detector file is written before upload.
 
     Returns
     -------
-    float | None
-        Share between 0 and 1 rounded to 4 decimals, or None when the
-        series is empty.
+    dict[str, object]
+        Metadata stored with the registered artifact.
+
+    Raises
+    ------
+    ValueError
+        If there are not enough feature rows to train and evaluate.
     """
-    if len(scores) == 0:
-        return None
-    return round(float((scores < 0).mean()), 4)
+    prices = load_prices(ticker, settings.start)
+    benchmark = load_benchmark_log_returns(settings.benchmark, settings.start)
+    earnings = load_earnings_days(ticker)
+    features = build_features(prices, benchmark, earnings)
+    if len(features) <= settings.train_min:
+        raise ValueError(
+            f"Not enough history for {ticker!r}: {len(features)} feature "
+            f"rows, {settings.train_min} needed before the first score."
+        )
+
+    walk_forward = walk_forward_scores(
+        features,
+        train_min=settings.train_min,
+        step=settings.step,
+        contamination=settings.contamination,
+        n_estimators=settings.n_estimators,
+        random_seed=settings.random_seed,
+    )
+    detector = IsolationForestDetector(
+        contamination=settings.contamination,
+        n_estimators=settings.n_estimators,
+        random_seed=settings.random_seed,
+    ).fit(features)
+
+    metrics = {
+        "training_rows": len(features),
+        "walk_forward_rows": len(walk_forward),
+        "walk_forward_flagged_share": round(
+            float(walk_forward["is_atypical"].mean()), 4
+        ),
+    }
+    tracker.log_metrics(metrics)
+    metadata = {
+        **metrics,
+        "ticker": ticker,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "feature_columns": FEATURE_COLUMNS,
+    }
+    log_detector(tracker, detector, ticker, metadata, work_directory)
+    logger.info("Registered the detector of %s.", ticker)
+    return metadata
 
 
 def parse_arguments(
@@ -148,28 +210,35 @@ def parse_arguments(
         Parsed options, with ``tickers`` already split into a list.
     """
     parser = argparse.ArgumentParser(
-        description="Train the outlier detector of one or more tickers.",
+        description="Train and register the outlier detector of tickers.",
     )
     parser.add_argument(
         "--tickers",
         required=True,
         help="Comma-separated symbols, for example AAPL,PETR4.SA",
     )
-    parser.add_argument("--period", default=DEFAULT_PERIOD)
+    parser.add_argument("--start", default=DEFAULT_START)
+    parser.add_argument("--benchmark", default=DEFAULT_BENCHMARK)
     parser.add_argument(
         "--contamination",
         type=float,
         default=DEFAULT_CONTAMINATION,
     )
     parser.add_argument(
+        "--n-estimators",
+        type=int,
+        default=DEFAULT_N_ESTIMATORS,
+    )
+    parser.add_argument(
         "--random-seed",
         type=int,
         default=DEFAULT_RANDOM_SEED,
     )
+    parser.add_argument("--train-min", type=int, default=TRAIN_MIN)
+    parser.add_argument("--step", type=int, default=STEP)
     parser.add_argument(
-        "--model-directory",
-        type=Path,
-        default=DEFAULT_MODEL_DIRECTORY,
+        "--wandb-project",
+        default=DEFAULT_PROJECT_NAME,
     )
     options = parser.parse_args(arguments)
     symbols = (symbol.strip() for symbol in options.tickers.split(","))
@@ -190,23 +259,32 @@ def main(arguments: Sequence[str] | None = None) -> int:
     Returns
     -------
     int
-        0 when every ticker was trained, 1 when at least one failed.
+        0 when every ticker was registered, 1 when at least one failed.
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     options = parse_arguments(arguments)
+    settings = TrainingSettings(
+        start=options.start,
+        benchmark=options.benchmark,
+        contamination=options.contamination,
+        n_estimators=options.n_estimators,
+        random_seed=options.random_seed,
+        train_min=options.train_min,
+        step=options.step,
+    )
     failures = 0
-    for ticker in options.tickers:
-        try:
-            train_ticker(
-                ticker=ticker,
-                period=options.period,
-                model_directory=options.model_directory,
-                contamination=options.contamination,
-                random_seed=options.random_seed,
-            )
-        except ValueError as error:
-            failures += 1
-            logger.error("Could not train %s: %s", ticker, error)
+    with tempfile.TemporaryDirectory() as work_directory:
+        for ticker in options.tickers:
+            try:
+                train_ticker(
+                    ticker=ticker,
+                    settings=settings,
+                    project_name=options.wandb_project,
+                    work_directory=Path(work_directory),
+                )
+            except (ValueError, RuntimeError) as error:
+                failures += 1
+                logger.error("Could not train %s: %s", ticker, error)
     return 1 if failures else 0
 
 

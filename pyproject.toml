@@ -12,6 +12,9 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "pydantic",
+    "wandb>=0.31.0",
+    "python-dotenv>=1.2.4",
+    "tqdm>=4.70.1",
 ]
 
 [project.optional-dependencies]
@@ -41,3 +44,5 @@ max-line-length = 79
 
 [tool.pylint.design]
 min-public-methods = 1
+max-args = 7
+max-positional-arguments = 7
