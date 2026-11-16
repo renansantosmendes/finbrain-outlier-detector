@@ -1,5 +1,6 @@
 """Tests of the in-memory model registry, with wandb mocked."""
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -214,3 +215,14 @@ def test_list_trained_tickers_reads_the_ticker_from_each_artifact(
         property(lambda self: fake_api),
     )
     assert registry.list_trained_tickers() == ["AAPL", "PETR4.SA"]
+
+
+def test_use_writable_wandb_directories_keeps_existing_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WANDB_CONFIG_DIR", "/already/set")
+    model_registry.use_writable_wandb_directories(tmp_path)
+    assert os.environ["WANDB_CONFIG_DIR"] == "/already/set"
+    assert os.environ["WANDB_CACHE_DIR"] == str(tmp_path / "cache")
+    assert os.environ["WANDB_DATA_DIR"] == str(tmp_path / "data")
